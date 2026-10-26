@@ -33,17 +33,44 @@ from log_extractor import CowrieLogExtractor
 
 console = Console()
 
-# Commands that could harm the Kali host or break the Cowrie session —
-# Cowrie emulates them safely, but we skip ones that would kill our SSH channel.
+# Commands that could harm the Kali host or break the Cowrie session.
+# We block on the BASE command and also scan the full command string for
+# ssh/scp/sftp which would try to open a nested SSH session inside Cowrie,
+# killing the transport (the "SSH session not active" crash).
 BLOCKED_COMMANDS = {
     "exit", "logout", "quit", "reboot", "shutdown", "halt", "poweroff",
+    "ssh", "scp", "sftp",
 }
+
+# Tokens that, if present anywhere in a compound command (&&, ||, ;, |),
+# indicate a nested SSH attempt that would kill the channel.
+_SSH_TOKENS = {"ssh", "scp", "sftp"}
 
 
 def _is_safe(command: str) -> bool:
-    """Return False if the command would terminate the SSH session."""
-    base = command.strip().split()[0].lower() if command.strip() else ""
-    return base not in BLOCKED_COMMANDS
+    """
+    Return False if the command would terminate or break the SSH session.
+
+    Checks:
+    1. The first token (base command) is not in BLOCKED_COMMANDS.
+    2. No token in any &&/||/;-chained sub-command is an SSH variant.
+       e.g.  "ssh -v 1.2.3.4 && cat /etc/passwd"  →  unsafe
+             "nmap -sV 1.2.3.4 ; id"               →  safe
+    """
+    if not command.strip():
+        return True  # empty → harmless
+
+    # Split on common shell separators to inspect each sub-command
+    import re
+    parts = re.split(r"&&|\|\||\|(?!\|)|;", command)
+    for part in parts:
+        tokens = part.strip().split()
+        if not tokens:
+            continue
+        base = tokens[0].lstrip("(").lower()  # handle "(ssh ...)"
+        if base in BLOCKED_COMMANDS or base in _SSH_TOKENS:
+            return False
+    return True
 
 
 class AgenticRunner:
@@ -56,22 +83,45 @@ class AgenticRunner:
         self.max_steps = max_steps
         self.step_delay = step_delay  # seconds between commands (lets Cowrie flush logs)
 
-    def run(self, scenario_name: str, scenario_description: str) -> dict:
+    def run(
+        self,
+        scenario_name: str,
+        scenario_description: str,
+        custom_scenario_text: str | None = None,
+    ) -> dict:
         """
         Execute the full agentic loop for one scenario.
 
+        Args:
+            scenario_name:        Short identifier used for logging / report filenames.
+            scenario_description: One-liner description (from the JSON or auto-generated).
+            custom_scenario_text: Optional free-text scenario entered by the user (≤2000 chars).
+                                  When supplied the LLM receives the full text as additional
+                                  context for every next-command decision.
+
         Returns a dict:
         {
-            "scenario":       str,
-            "attack_history": list[dict],   # each step: {step, command, output, cowrie_logs, reasoning}
-            "all_log_entries": list[dict],  # full Cowrie session log window
-            "steps_taken":    int,
-            "stopped_early":  bool,         # True if LLM called DONE before max_steps
+            "scenario":           str,
+            "attack_history":     list[dict],   # each step: {step, command, output, cowrie_logs, reasoning}
+            "all_log_entries":    list[dict],   # full Cowrie session log window
+            "steps_taken":        int,
+            "stopped_early":      bool,         # True if LLM called DONE before max_steps
+            "custom_scenario_text": str | None, # echoed back for report generation
         }
         """
+        # Build the effective description the LLM sees — include full custom text when available
+        effective_description = scenario_description
+        if custom_scenario_text:
+            effective_description = (
+                f"{scenario_description}\n\n"
+                f"[User-supplied scenario details]\n{custom_scenario_text}"
+            )
+
         console.print(Panel(
             f"[bold cyan]Agentic Attack Loop — {scenario_name}[/bold cyan]\n"
-            f"Max steps: {self.max_steps}  |  Step delay: {self.step_delay}s",
+            f"Max steps: {self.max_steps}  |  Step delay: {self.step_delay}s"
+            + (f"\nCustom scenario: [italic]{custom_scenario_text[:120]}…[/italic]"
+               if custom_scenario_text else ""),
             title="AgenticRunner"
         ))
 
@@ -112,7 +162,7 @@ class AgenticRunner:
             console.print("    [dim]Asking LLM for next command...[/dim]")
             decision = self.llm.generate_next_command(
                 scenario=scenario_name,
-                scenario_description=scenario_description,
+                scenario_description=effective_description,
                 attack_history=attack_history,
                 max_steps=self.max_steps,
             )
@@ -191,9 +241,10 @@ class AgenticRunner:
         )
 
         return {
-            "scenario":        scenario_name,
-            "attack_history":  attack_history,
-            "all_log_entries": all_log_entries,
-            "steps_taken":     steps_taken,
-            "stopped_early":   stopped_early,
+            "scenario":              scenario_name,
+            "attack_history":        attack_history,
+            "all_log_entries":       all_log_entries,
+            "steps_taken":           steps_taken,
+            "stopped_early":         stopped_early,
+            "custom_scenario_text":  custom_scenario_text,
         }

@@ -26,6 +26,10 @@ COWRIE_USER_ON_KALI = "cowrie" # the Linux user that owns cowrie's files
 # Set to None to auto-detect from Kali's timezone at runtime.
 COWRIE_TZ_OFFSET_SECONDS = None  # None = auto-detect, or set e.g. -14400
 
+# ─── Custom Scenario ──────────────────────────────────────────────────────────
+# Maximum number of characters the user may enter for a free-text custom scenario.
+CUSTOM_SCENARIO_MAX_CHARS = 2000
+
 # ─── Scenarios ────────────────────────────────────────────────────────────────
 SCENARIOS = [
     "credential_discovery",

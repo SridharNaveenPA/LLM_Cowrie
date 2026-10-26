@@ -10,6 +10,10 @@ class CowrieSSHExecutor:
     """
     Connects to Cowrie honeypot via SSH (Paramiko) and executes attacker commands.
     Cowrie accepts any credentials, so this simulates a successful brute-force entry.
+
+    Design: each command gets its own fresh SSH connection + shell channel.
+    This ensures a bad command (e.g. nested `ssh`, `exit`, a crashed emulation)
+    never leaves the executor in a broken state for the next command.
     """
 
     def __init__(self, host: str, port: int, username: str, password: str):
@@ -19,11 +23,26 @@ class CowrieSSHExecutor:
         self.password = password
         self.client: Optional[paramiko.SSHClient] = None
 
+    # ── Connection helpers ────────────────────────────────────────────────────
+
     def connect(self) -> bool:
+        """Establish the initial Cowrie SSH connection."""
+        return self._new_connection()
+
+    def _new_connection(self) -> bool:
+        """Create a fresh Paramiko client connected to Cowrie."""
+        # Close any stale client first
         try:
-            self.client = paramiko.SSHClient()
-            self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            self.client.connect(
+            if self.client:
+                self.client.close()
+        except Exception:
+            pass
+        self.client = None
+
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(
                 hostname=self.host,
                 port=self.port,
                 username=self.username,
@@ -34,49 +53,108 @@ class CowrieSSHExecutor:
                 look_for_keys=False,
                 allow_agent=False,
             )
-            console.print(f"  [green]✓[/green] Connected to Cowrie at {self.host}:{self.port}")
+            self.client = client
             return True
         except Exception as e:
-            console.print(f"  [red]✗[/red] Failed to connect to Cowrie: {e}")
+            console.print(f"  [red]✗[/red] Cowrie connect failed: {e}")
+            self.client = None
             return False
+
+    def _is_alive(self) -> bool:
+        """Return True if the current transport is still active."""
+        try:
+            t = self.client.get_transport() if self.client else None
+            return t is not None and t.is_active()
+        except Exception:
+            return False
+
+    def _ensure_connected(self) -> bool:
+        """Reconnect if the current session is dead."""
+        if self._is_alive():
+            return True
+        console.print("  [yellow]⚡[/yellow] Cowrie transport dead — reconnecting...")
+        return self._new_connection()
+
+    # ── Command execution ─────────────────────────────────────────────────────
 
     def execute_commands(self, commands: list[str], delay: float = 1.5) -> list[dict]:
         """
-        Execute commands one by one via an interactive shell channel.
-        Returns a list of result dicts with command + output.
+        Execute commands one by one, each in its own fresh shell channel.
+        A dead/crashed connection is transparently re-established before each command.
+        Returns a list of result dicts: {command, output, success, [error]}.
         """
-        if not self.client:
-            raise RuntimeError("Not connected. Call connect() first.")
+        if not self.client and not self._new_connection():
+            raise RuntimeError("Not connected to Cowrie and reconnect failed.")
 
         results = []
-        channel = self.client.invoke_shell()
-        channel.settimeout(15)
-
-        # Wait for initial banner
-        time.sleep(2)
-        self._drain(channel)
-
         for i, cmd in enumerate(commands):
-            console.print(f"    [{i+1}/{len(commands)}] Executing: [cyan]{cmd[:60]}[/cyan]")
-            try:
-                channel.send(cmd + "\n")
-                time.sleep(delay)
-                output = self._drain(channel)
-                results.append({
-                    "command": cmd,
-                    "output": output,
-                    "success": True,
-                })
-            except Exception as e:
+            console.print(f"    [{i+1}/{len(commands)}] Executing: [cyan]{cmd[:80]}[/cyan]")
+
+            # Guarantee a live transport before every command
+            if not self._ensure_connected():
                 results.append({
                     "command": cmd,
                     "output": "",
                     "success": False,
-                    "error": str(e),
+                    "error": "Could not reconnect to Cowrie",
                 })
+                continue
 
-        channel.close()
+            output, success, error = self._run_single(cmd, delay)
+            results.append({
+                "command": cmd,
+                "output":  output,
+                "success": success,
+                **({"error": error} if error else {}),
+            })
+
         return results
+
+    def _run_single(self, cmd: str, delay: float) -> tuple[str, bool, str]:
+        """
+        Open a fresh shell channel, run one command, drain output, close channel.
+        Returns (output, success, error_msg).
+
+        If the channel/transport dies mid-command (e.g. nested ssh killed it),
+        we catch the exception, mark success=False, and let _ensure_connected()
+        handle the reconnect on the next call.
+        """
+        channel = None
+        try:
+            channel = self.client.invoke_shell()
+            channel.settimeout(15)
+
+            # Drain the Cowrie login banner before sending our command
+            time.sleep(1.5)
+            self._drain(channel)
+
+            channel.send(cmd + "\n")
+            time.sleep(delay)
+            output = self._drain(channel)
+            return output, True, ""
+
+        except paramiko.SSHException as e:
+            # The nested ssh / bad command killed the transport — mark dead
+            # so the next _ensure_connected() will reconnect.
+            console.print(f"    [yellow]⚠[/yellow] SSH channel died during '{cmd[:60]}': {e}")
+            try:
+                if self.client:
+                    self.client.close()
+            except Exception:
+                pass
+            self.client = None
+            return "", False, str(e)
+
+        except Exception as e:
+            console.print(f"    [yellow]⚠[/yellow] Error during '{cmd[:60]}': {e}")
+            return "", False, str(e)
+
+        finally:
+            try:
+                if channel and not channel.closed:
+                    channel.close()
+            except Exception:
+                pass
 
     def _drain(self, channel, timeout: float = 5.0) -> str:
         """Read all available output from channel."""

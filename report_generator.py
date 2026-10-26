@@ -17,18 +17,23 @@ class ReportGenerator:
         all_log_entries: list[dict],
         llm_analysis: dict,
         stopped_early: bool = False,
+        custom_scenario_text: str | None = None,
     ) -> str:
         """
         Generate a Markdown report from an agentic attack run.
 
         attack_history items:
             {"step": int, "command": str, "output": str, "cowrie_logs": list, "reasoning": str}
+
+        custom_scenario_text: When set (custom mode), the user's free-text scenario
+            description is included verbatim in the report header.
         """
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
         filename  = f"{REPORTS_DIR}/{scenario}_{timestamp}.md"
         md = self._build_agentic_markdown(
             scenario, attack_history, all_log_entries,
-            llm_analysis, stopped_early, timestamp
+            llm_analysis, stopped_early, timestamp,
+            custom_scenario_text=custom_scenario_text,
         )
         with open(filename, "w", encoding="utf-8") as f:
             f.write(md)
@@ -95,12 +100,14 @@ class ReportGenerator:
         analysis: dict,
         stopped_early: bool,
         timestamp: str,
+        custom_scenario_text: str | None = None,
     ) -> str:
 
         # Handle raw_analysis fallback
         if "raw_analysis" in analysis and "evaluation" not in analysis:
             return self._build_agentic_fallback(
-                scenario, attack_history, all_log_entries, analysis, stopped_early, timestamp
+                scenario, attack_history, all_log_entries, analysis, stopped_early, timestamp,
+                custom_scenario_text=custom_scenario_text,
             )
 
         eval_block       = analysis.get("evaluation", {})
@@ -123,26 +130,36 @@ class ReportGenerator:
 |---|---|
 | **Scenario** | `{scenario}` |
 | **Generated** | {timestamp} UTC |
-| **Mode** | Agentic (step-by-step LLM attack loop) |
+| **Mode** | {'Custom (free-text)' if custom_scenario_text else 'Predefined'} Agentic Attack Loop |
 | **Model** | Ollama LLM (llama3.1:8b) |
 | **Overall Grade** | {grade_icon} **{grade}** ({ovr_score}/10) |
 | **Detection Rate** | {det_rate} |
 | **Events Captured** | {total_ev} |
 | **Attack Steps** | {cmds_count} ({stop_reason}) |
 
----
-
-## Executive Summary
-
-{overall}
-
----
-
-## Evaluation Scorecard
-
-| Criterion | Score | Summary |
-|-----------|-------|---------|
 """
+        # ── Custom scenario block ─────────────────────────────────────────────
+        if custom_scenario_text:
+            md += "## Custom Scenario Description\n\n"
+            md += "> This evaluation was driven by a user-supplied attack scenario rather than a\n"
+            md += "> predefined scenario file. The full scenario text is reproduced below.\n\n"
+            md += "```\n"
+            md += custom_scenario_text
+            md += "\n```\n\n"
+            md += "---\n\n"
+        else:
+            md += "---\n\n"
+
+        # ── Executive Summary ─────────────────────────────────────────────────
+        md += "## Executive Summary\n\n"
+        md += f"{overall}\n\n"
+        md += "---\n\n"
+
+        # ── Evaluation Scorecard ──────────────────────────────────────────────
+        md += "## Evaluation Scorecard\n\n"
+        md += "| Criterion | Score | Summary |\n"
+        md += "|-----------|-------|---------|\n"
+
         criteria = [
             ("realism",                "Realism"),
             ("emulation_accuracy",     "Emulation Accuracy"),
@@ -259,10 +276,15 @@ class ReportGenerator:
         analysis: dict,
         stopped_early: bool,
         timestamp: str,
+        custom_scenario_text: str | None = None,
     ) -> str:
         """Fallback when LLM didn't return structured JSON for final report."""
         md  = f"# Cowrie Evaluation Report — {scenario} (Agentic Mode)\n\n"
         md += f"**Generated:** {timestamp} UTC\n\n"
+        if custom_scenario_text:
+            md += "## Custom Scenario Description\n\n"
+            md += "> User-supplied scenario text:\n\n"
+            md += f"```\n{custom_scenario_text}\n```\n\n---\n\n"
         md += "## LLM Analysis\n\n"
         md += "> Note: LLM returned unstructured output. Raw analysis below.\n\n"
         md += analysis.get("raw_analysis", "_No analysis_")

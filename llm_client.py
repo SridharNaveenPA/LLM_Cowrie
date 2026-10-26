@@ -105,7 +105,10 @@ class OllamaClient:
             "3. If finished:   {\"done\": true,  \"command\": null,                      \"reasoning\": \"<summary of findings>\"}\n"
             "4. Prefer commands that probe realism: version mismatches, empty responses, fake filesystem.\n"
             "5. Do NOT repeat a command already in the history unless probing a variation.\n"
-            f"6. You may run at most {max_steps} steps total. You have used {steps_done} so far."
+            f"6. You may run at most {max_steps} steps total. You have used {steps_done} so far.\n"
+            "7. NEVER generate a command that starts with or contains 'ssh', 'scp', or 'sftp'. "
+            "   These open a nested SSH session inside Cowrie and crash the evaluator. "
+            "   Use alternatives like 'nc', 'curl', 'wget', 'nmap', or direct file reads instead."
         )
 
         user_prompt = (
@@ -284,6 +287,75 @@ class OllamaClient:
             "parse_error":       "Could not extract JSON",
             "total_events_logged": len(all_cowrie_logs),
         }
+
+    # ── Custom scenario: generate initial attack commands from free-text ─────────
+
+    def generate_commands_from_custom_scenario(self, scenario_text: str) -> list[str]:
+        """
+        Given a free-text scenario description (up to 2000 chars), generate a list
+        of realistic shell commands an attacker would run on a Cowrie SSH honeypot.
+
+        Returns a flat list of command strings (at most 15), ordered logically.
+        Falls back to an empty list if parsing fails.
+        """
+        system_prompt = (
+            "You are a red team operator simulating an attack on a Cowrie SSH Linux honeypot "
+            "for controlled security evaluation. "
+            "Given a free-text attack scenario description, produce a realistic, ordered list "
+            "of shell commands that would be used to carry out that scenario on a Linux target. "
+            "Output ONLY a valid JSON array of shell command strings — no markdown, no explanation. "
+            'Example: ["whoami", "id", "uname -a"]'
+        )
+        user_prompt = (
+            f"Attack scenario description:\n{scenario_text}\n\n"
+            "Generate up to 15 realistic Linux shell commands for this scenario, "
+            "ordered from initial reconnaissance to the final objective. "
+            "Prefer commands that expose Cowrie honeypot weaknesses (fake filesystem, "
+            "version mismatches, empty responses). "
+            "IMPORTANT: Do NOT include any command that starts with or contains 'ssh', 'scp', "
+            "or 'sftp' — these crash the evaluator by opening a nested SSH session. "
+            "Use alternatives like 'nc', 'curl', 'wget', 'nmap', or direct file reads instead. "
+            "Return a single flat JSON array of command strings only."
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ]
+        raw = self._chat(messages, temperature=0.4)
+
+        try:
+            cleaned = raw.strip()
+            if "```" in cleaned:
+                for part in cleaned.split("```"):
+                    part = part.strip()
+                    if part.startswith("json"):
+                        part = part[4:].strip()
+                    if part.startswith("["):
+                        try:
+                            commands = json.loads(part)
+                            if isinstance(commands, list):
+                                return [c for c in commands if isinstance(c, str) and c.strip()]
+                        except Exception:
+                            continue
+            # Direct parse
+            if cleaned.startswith("["):
+                commands = json.loads(cleaned)
+                if isinstance(commands, list):
+                    return [c for c in commands if isinstance(c, str) and c.strip()]
+            # Slice out array
+            start = cleaned.find("[")
+            end   = cleaned.rfind("]")
+            if start != -1 and end != -1:
+                commands = json.loads(cleaned[start:end + 1])
+                if isinstance(commands, list):
+                    return [c for c in commands if isinstance(c, str) and c.strip()]
+        except json.JSONDecodeError:
+            pass
+
+        print("  [warn] Could not parse custom scenario commands — LLM returned: "
+              + raw[:200])
+        return []
 
     # ── Legacy: batch command generation (kept for backward compatibility) ────
 
