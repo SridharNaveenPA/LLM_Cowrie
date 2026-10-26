@@ -1,0 +1,13 @@
+python main.py --scenario credential_discovery
+
+
+source cowrie-env/bin/activate
+
+sudo su - cowrie
+cd cowrie 
+source cowrie-env/bin/activate 
+cowrie status 
+cowrie start 
+cowrie status 
+
+https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=11389636
